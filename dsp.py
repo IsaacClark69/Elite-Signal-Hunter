@@ -49,6 +49,10 @@ class SignalProcessor:
         self.noise_mean = np.zeros(self.num_bins)
         self.noise_std = np.ones(self.num_bins)
         self.is_calibrated = False
+        
+        # Tuning Parameters
+        self.spectral_floor = 0.1 # Keep 10% of the original signal floor to prevent "musical noise"
+        self.oversubtraction = 1.5 # Subtract 1.5x the noise profile to push it down
 
     def capture_noise_profile(self, magnitude_buffer):
         """
@@ -71,19 +75,30 @@ class SignalProcessor:
 
     def apply_spectral_gate(self, magnitude_data):
         """
-        Subtracts the calibrated noise profile from the incoming signal.
+        Subtracts the calibrated noise profile from the incoming signal using a Soft Knee approach.
         
         Args:
             magnitude_data (np.ndarray): The live frequency magnitude frame.
             
         Returns:
-            np.ndarray: The gated magnitude (signal - noise_mean), clipped at 0.
+            np.ndarray: The gated magnitude.
         """
         if not self.is_calibrated:
             return magnitude_data
         
-        # Spectral subtraction
-        return np.maximum(magnitude_data - self.noise_mean, 0)
+        # Soft Spectral Subtraction
+        # 1. Calculate the subtraction amount (Oversubtraction)
+        subtraction_amount = self.noise_mean * self.oversubtraction
+        
+        # 2. Perform subtraction
+        subtracted = magnitude_data - subtraction_amount
+        
+        # 3. Apply Spectral Floor (instead of hard clipping to 0)
+        # This keeps a tiny bit of the original signal structure, preventing the "black void" effect
+        # where faint details get swallowed.
+        floor = magnitude_data * self.spectral_floor
+        
+        return np.maximum(subtracted, floor)
 
     def detect_anomaly(self, magnitude_data, threshold=3.0):
         """

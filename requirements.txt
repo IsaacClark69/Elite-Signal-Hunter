@@ -2,3 +2,5 @@ PyQt6
 numpy
 pyqtgraph
 soundfile
+scipy
+pyaudiowpatch

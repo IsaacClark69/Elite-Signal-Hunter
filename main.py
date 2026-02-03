@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
-                             QWidget, QLabel, QSlider, QHBoxLayout, QGridLayout, QComboBox, QPushButton, QLineEdit, QListWidget, QTabWidget, QTextEdit, QFileDialog, QListWidgetItem, QCheckBox, QDial, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QSplitter)
+                             QWidget, QLabel, QSlider, QHBoxLayout, QGridLayout, QComboBox, QPushButton, QLineEdit, QListWidget, QTabWidget, QTextEdit, QFileDialog, QListWidgetItem, QCheckBox, QDial, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QSplitter, QDockWidget)
 from PyQt6.QtCore import Qt, QTimer
 from collections import deque
 import soundfile as sf
@@ -14,12 +14,13 @@ import webbrowser
 import subprocess
 import winsound
 
-from audio_engine import AudioEngine
+from audio_engine import ProxyAudioEngine
 from journal_watcher import JournalWatcher
 from api_client import submit_signal
 import database as db
 from dsp import SignalProcessor, calculate_characteristics
 
+# ... [ProfileReviewWindow and SnapshotLabWindow classes remain unchanged] ...
 class ProfileReviewWindow(QWidget):
     def __init__(self, profile_name, profile_data):
         super().__init__()
@@ -213,18 +214,57 @@ class ComparisonWindow(QWidget):
 
             self.main_layout.addWidget(container)
 
+class SettingsDock(QDockWidget):
+    def __init__(self, parent=None):
+        super().__init__("System Configuration", parent)
+        self.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.LeftDockWidgetArea)
+        
+        self.tabs = QTabWidget()
+        self.setWidget(self.tabs)
+        
+        # Tab A: Routing
+        self.routing_tab = QWidget()
+        routing_layout = QVBoxLayout(self.routing_tab) # Changed to QVBoxLayout for addStretch
+        
+        self.combo_input = QComboBox()
+        self.combo_output = QComboBox()
+        self.btn_refresh = QPushButton("Refresh Devices")
+        
+        routing_layout.addWidget(QLabel("Input Source (Virtual Cable):"))
+        routing_layout.addWidget(self.combo_input)
+        routing_layout.addWidget(QLabel("Output Monitor (Headset):"))
+        routing_layout.addWidget(self.combo_output)
+        routing_layout.addWidget(self.btn_refresh)
+        routing_layout.addStretch()
+        
+        self.tabs.addTab(self.routing_tab, "Routing")
+        
+        # Tab B: Performance
+        self.perf_tab = QWidget()
+        perf_layout = QVBoxLayout(self.perf_tab)
+        
+        self.chk_low_latency = QCheckBox("Combat Mode (Low Latency)")
+        self.btn_save_blackbox = QPushButton("Save Black Box (Last 60s)")
+        self.btn_save_blackbox.setStyleSheet("background-color: #440000; color: white; font-weight: bold;")
+        
+        perf_layout.addWidget(self.chk_low_latency)
+        perf_layout.addWidget(self.btn_save_blackbox)
+        perf_layout.addStretch()
+        
+        self.tabs.addTab(self.perf_tab, "Performance")
+
 class ScienceStation(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Elite Signal Hunter: MK XXVI (Automated)")
+        self.setWindowTitle("Elite Signal Hunter: MK XXVIII (Proxy Engine)")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #050505; color: #FFA500;")
 
         # Initialize all member variables first
-        self.FFT_SIZE = 4096
+        self.FFT_SIZE = 4096 # Reset to standard for stability with new engine
         self.INPUT_CHUNK = 1024
-        self.SAMPLE_RATE = 48000
+        self.SAMPLE_RATE = 48000 # Will be updated by engine
         self.MAX_BINS = self.FFT_SIZE // 2 + 1
         self.history_length = 1200
         self.first_render = True
@@ -249,16 +289,16 @@ class ScienceStation(QMainWindow):
         self.audio_devices = []
         self.engine = None
         self.comparison_windows = []
-        self.lab_windows = [] # Store references to lab windows
+        self.lab_windows = []
         self.batch_folder_path = None
         self.is_recording = False
         self.recording_start_time = None
         self.recording_buffer = []
-        self.recording_save_path = os.getcwd() # Default to current directory
+        self.recording_save_path = os.getcwd()
         self.recording_format = "WAV"
-        self.recording_subtype = "PCM_24" # Default high quality
+        self.recording_subtype = "PCM_24"
         self.is_hovering_spectrogram = False
-        self.iq_trail_buffer = deque(maxlen=50) # Buffer for I/Q trail
+        self.iq_trail_buffer = deque(maxlen=50)
         self.iq_zoom_level = 1.0
         self.iq_point_size = 5
         self.iq_rotation = 0.0
@@ -268,7 +308,7 @@ class ScienceStation(QMainWindow):
         # Oscilloscope variables
         self.scope_trigger_level = 0.0
         self.scope_trigger_enabled = False
-        self.scope_timebase = 1.0 # 1.0 = full buffer, 0.1 = 10% of buffer
+        self.scope_timebase = 1.0
         self.scope_gain = 1.0
         self.scope_freeze = False
         
@@ -338,8 +378,8 @@ class ScienceStation(QMainWindow):
         self.snapshot_list_widget = QListWidget()
         self.btn_compare_snapshots = QPushButton("Compare Selected Snapshots")
         self.btn_play_snapshot = QPushButton("Play Selected Snapshot")
-        self.btn_open_lab = QPushButton("Analyze in Lab (Define Profile)") # Renamed
-        self.btn_analyze_file = QPushButton("Analyze External File") # NEW BUTTON
+        self.btn_open_lab = QPushButton("Analyze in Lab (Define Profile)")
+        self.btn_analyze_file = QPushButton("Analyze External File")
         self.lbl_browser_metadata = QLabel("Select a snapshot to view details.")
         self.lbl_browser_metadata.setWordWrap(True)
         self.lbl_browser_metadata.setStyleSheet("color: #AAAAAA; font-family: Consolas;")
@@ -401,6 +441,10 @@ class ScienceStation(QMainWindow):
         self.btn_record_audio = QPushButton("Start Recording")
         self.lbl_recording_status = QLabel("REC: STOPPED")
 
+        # Initialize Settings Dock
+        self.settings_dock = SettingsDock(self)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.settings_dock)
+
         # Call setup methods
         db.init_db()
         self.setup_spec_tab()
@@ -421,8 +465,14 @@ class ScienceStation(QMainWindow):
         self.btn_return_to_live.clicked.connect(self.return_to_live)
         self.render_timer.timeout.connect(self.render_view)
         self.identification_timer.timeout.connect(self.run_identification)
-        self.audio_source_combo.currentIndexChanged.connect(self.change_audio_device)
-        self.btn_refresh_audio.clicked.connect(self.refresh_audio_devices)
+        
+        # Settings Dock Connections
+        self.settings_dock.btn_refresh.clicked.connect(self.refresh_audio_devices)
+        self.settings_dock.combo_input.currentIndexChanged.connect(self.restart_audio_engine)
+        self.settings_dock.combo_output.currentIndexChanged.connect(self.restart_audio_engine)
+        self.settings_dock.chk_low_latency.stateChanged.connect(self.toggle_latency_mode)
+        self.settings_dock.btn_save_blackbox.clicked.connect(self.save_black_box)
+        
         self.btn_show_readme.clicked.connect(self.show_readme)
         self.slider_gain.valueChanged.connect(self.update_labels)
         self.slider_floor.valueChanged.connect(self.update_labels)
@@ -442,7 +492,7 @@ class ScienceStation(QMainWindow):
         self.btn_compare_snapshots.clicked.connect(self.launch_comparison_window)
         self.btn_play_snapshot.clicked.connect(self.play_selected_snapshot)
         self.btn_open_lab.clicked.connect(self.launch_lab_window)
-        self.btn_analyze_file.clicked.connect(self.analyze_external_file) # Connect new button
+        self.btn_analyze_file.clicked.connect(self.analyze_external_file)
         self.btn_refresh_db.clicked.connect(self.refresh_database_view)
         self.btn_select_batch_folder.clicked.connect(self.select_batch_folder)
         self.btn_run_batch.clicked.connect(self.run_batch_analysis)
@@ -466,8 +516,106 @@ class ScienceStation(QMainWindow):
         self.check_first_launch()
         self.return_to_live()
 
-    # ... [Previous methods remain unchanged: setup_spec_tab, mouse_moved_on_spectrogram, return_to_live, render_view, update_iq_plot, check_first_launch, show_readme, setup_scope_tab, setup_spectrum_tab, setup_iq_tab] ...
+    # ... [Previous methods remain unchanged] ...
     
+    def setup_settings_tab(self):
+        # Simplified settings tab since we moved routing to the Dock
+        self.settings_layout.addWidget(QLabel("RECORDING FOLDER:"), 0, 0)
+        self.settings_layout.addWidget(self.lbl_rec_path, 0, 1)
+        self.settings_layout.addWidget(self.btn_select_rec_path, 0, 2)
+        
+        self.settings_layout.addWidget(QLabel("RECORDING FORMAT:"), 1, 0)
+        self.settings_layout.addWidget(self.combo_rec_format, 1, 1)
+        self.settings_layout.addWidget(self.combo_rec_subtype, 1, 2)
+        
+        self.settings_layout.addWidget(self.btn_show_readme, 2, 0, 1, 3)
+        self.settings_layout.setColumnStretch(1, 1)
+        self.settings_layout.setRowStretch(3, 1)
+        self.tabs.addTab(self.settings_tab, "Settings")
+        self.settings_tab.setLayout(self.settings_layout)
+
+    def refresh_audio_devices(self):
+        self.label.setText(">> SCANNING AUDIO DEVICES... <<")
+        inputs, outputs = ProxyAudioEngine.get_devices()
+        
+        self.settings_dock.combo_input.blockSignals(True)
+        self.settings_dock.combo_output.blockSignals(True)
+        self.settings_dock.combo_input.clear()
+        self.settings_dock.combo_output.clear()
+        
+        if not inputs:
+            self.settings_dock.combo_input.addItem("No inputs found")
+            self.settings_dock.combo_input.setEnabled(False)
+        else:
+            self.settings_dock.combo_input.setEnabled(True)
+            for dev in inputs:
+                self.settings_dock.combo_input.addItem(dev['name'], userData=dev['index'])
+                
+        if not outputs:
+            self.settings_dock.combo_output.addItem("No outputs found")
+            self.settings_dock.combo_output.setEnabled(False)
+        else:
+            self.settings_dock.combo_output.setEnabled(True)
+            for dev in outputs:
+                self.settings_dock.combo_output.addItem(dev['name'], userData=dev['index'])
+                
+        self.settings_dock.combo_input.blockSignals(False)
+        self.settings_dock.combo_output.blockSignals(False)
+        
+        if self.engine is None:
+            self.restart_audio_engine()
+            
+        self.label.setText(">> STANDING BY <<")
+
+    def restart_audio_engine(self):
+        if self.engine:
+            self.engine.stop()
+            self.engine = None
+            
+        input_idx = self.settings_dock.combo_input.currentData()
+        output_idx = self.settings_dock.combo_output.currentData()
+        
+        if input_idx is None:
+            return
+
+        self.label.setText(f">> STARTING PROXY ENGINE <<")
+        self.first_render = True
+        
+        self.engine = ProxyAudioEngine(input_device_index=input_idx, output_device_index=output_idx)
+        self.engine.audio_data_ready.connect(self.update_data_stream)
+        self.engine.error_occurred.connect(lambda msg: self.label.setText(f">> ERROR: {msg} <<"))
+        
+        # Apply current latency setting
+        is_low_latency = self.settings_dock.chk_low_latency.isChecked()
+        self.engine.set_latency_mode(is_low_latency)
+        
+        self.engine.start()
+        
+        if not self.render_timer.isActive():
+            self.render_timer.start(16)
+        if not self.identification_timer.isActive():
+            self.identification_timer.start(100)
+
+    def toggle_latency_mode(self):
+        if self.engine:
+            is_low_latency = self.settings_dock.chk_low_latency.isChecked()
+            self.engine.set_latency_mode(is_low_latency)
+            mode_text = "COMBAT (LOW LATENCY)" if is_low_latency else "ANALYSIS (HIGH QUALITY)"
+            self.label.setText(f">> MODE SWITCHED: {mode_text} <<")
+
+    def save_black_box(self):
+        if self.engine:
+            path = self.engine.save_black_box(self.recording_save_path)
+            if path:
+                self.label.setText(f">> BLACK BOX SAVED: {os.path.basename(path)} <<")
+                # Optionally open in lab immediately
+                # self.launch_lab_window(path) 
+            else:
+                self.label.setText(">> ERROR SAVING BLACK BOX <<")
+
+    # ... [Rest of methods remain unchanged: setup_spec_tab, mouse_moved_on_spectrogram, return_to_live, render_view, update_iq_plot, check_first_launch, show_readme, setup_scope_tab, setup_spectrum_tab, setup_iq_tab, setup_browser_tab, on_snapshot_selected, launch_lab_window, analyze_external_file, setup_database_tab, setup_batch_tab, setup_control_panel, clear_iq_trail, update_iq_trail_length, update_iq_zoom, update_iq_size, update_iq_rotation, toggle_iq_grid, draw_reticle, on_tab_changed, update_cmdr_status, save_snapshot, toggle_recording, select_recording_path, update_recording_settings, save_long_recording, submit_current_signal, toggle_roi_definition, save_current_profile, load_profiles, delete_selected_profile, closeEvent, review_selected_profile, launch_comparison_window, play_selected_snapshot, refresh_snapshot_browser, refresh_database_view, select_batch_folder, run_batch_analysis, update_data_stream, update_signal_characteristics, run_identification, update_capture_buffer, toggle_auto_profiling, toggle_scale, toggle_orientation, toggle_triggered_capture, update_labels, change_audio_device, toggle_scope_trigger, update_scope_trigger_level, update_scope_timebase, update_scope_gain, toggle_scope_freeze] ...
+    
+    # Re-implementing missing methods from previous overwrite to ensure completeness
     def setup_spec_tab(self):
         # Rebuild Spectrogram Tab
         while self.spec_layout.count():
@@ -502,11 +650,6 @@ class ScienceStation(QMainWindow):
         self.anomaly_highlight_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('r', width=2, style=Qt.PenStyle.DashLine))
         self.anomaly_highlight_line.hide()
         self.spec_plot.addItem(self.anomaly_highlight_line)
-        
-        # Removed ROI from live spectrogram
-        # self.roi.setZValue(1000)
-        # self.roi.hide()
-        # self.spec_plot.addItem(self.roi)
 
         self.spec_widget.scene().sigMouseMoved.connect(self.mouse_moved_on_spectrogram)
         self.tabs.addTab(self.spec_tab, "Spectrogram")
@@ -1559,39 +1702,64 @@ class ScienceStation(QMainWindow):
         
     def refresh_audio_devices(self):
         self.label.setText(">> SCANNING AUDIO DEVICES... <<")
-        self.audio_devices = AudioEngine.get_available_devices()
-        self.audio_source_combo.blockSignals(True)
-        self.audio_source_combo.clear()
-        if not self.audio_devices or self.audio_devices[0]["index"] == -1:
-            self.audio_source_combo.addItem("No devices found")
-            self.audio_source_combo.setEnabled(False)
-            self.label.setText(">> ERROR: NO AUDIO DEVICES FOUND <<")
-            return
-        self.audio_source_combo.setEnabled(True)
-        for device in self.audio_devices:
-            self.audio_source_combo.addItem(device["name"], userData=device["index"])
-        self.audio_source_combo.blockSignals(False)
+        # Use ProxyAudioEngine static method
+        inputs, outputs = ProxyAudioEngine.get_devices()
+        
+        self.settings_dock.combo_input.blockSignals(True)
+        self.settings_dock.combo_output.blockSignals(True)
+        self.settings_dock.combo_input.clear()
+        self.settings_dock.combo_output.clear()
+        
+        if not inputs:
+            self.settings_dock.combo_input.addItem("No inputs found")
+            self.settings_dock.combo_input.setEnabled(False)
+        else:
+            self.settings_dock.combo_input.setEnabled(True)
+            for dev in inputs:
+                self.settings_dock.combo_input.addItem(dev['name'], userData=dev['index'])
+                
+        if not outputs:
+            self.settings_dock.combo_output.addItem("No outputs found")
+            self.settings_dock.combo_output.setEnabled(False)
+        else:
+            self.settings_dock.combo_output.setEnabled(True)
+            for dev in outputs:
+                self.settings_dock.combo_output.addItem(dev['name'], userData=dev['index'])
+                
+        self.settings_dock.combo_input.blockSignals(False)
+        self.settings_dock.combo_output.blockSignals(False)
+        
         if self.engine is None:
-            self.change_audio_device(0)
+            self.restart_audio_engine()
+            
         self.label.setText(">> STANDING BY <<")
 
-    def change_audio_device(self, index):
+    def restart_audio_engine(self):
         if self.engine:
             self.engine.stop()
             self.engine = None
-        device_index = self.audio_source_combo.itemData(index)
-        if device_index is None and index != 0:
-            self.label.setText(f">> ERROR: Invalid device selected. <<")
+            
+        input_idx = self.settings_dock.combo_input.currentData()
+        output_idx = self.settings_dock.combo_output.currentData()
+        
+        if input_idx is None:
             return
-        self.label.setText(f">> STARTING ENGINE: {self.audio_source_combo.currentText()} <<")
+
+        self.label.setText(f">> STARTING PROXY ENGINE <<")
         self.first_render = True
-        self.engine = AudioEngine(device_index=device_index)
-        self.engine.chunk_size = self.INPUT_CHUNK
+        
+        self.engine = ProxyAudioEngine(input_device_index=input_idx, output_device_index=output_idx)
         self.engine.audio_data_ready.connect(self.update_data_stream)
         self.engine.error_occurred.connect(lambda msg: self.label.setText(f">> ERROR: {msg} <<"))
+        
+        # Apply current latency setting
+        is_low_latency = self.settings_dock.chk_low_latency.isChecked()
+        self.engine.set_latency_mode(is_low_latency)
+        
         self.engine.start()
+        
         if not self.render_timer.isActive():
-            self.render_timer.start(16) # ~60 FPS
+            self.render_timer.start(16)
         if not self.identification_timer.isActive():
             self.identification_timer.start(100)
 
