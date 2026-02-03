@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout,
-                             QWidget, QLabel, QSlider, QHBoxLayout, QGridLayout, QComboBox, QPushButton, QLineEdit, QListWidget, QTabWidget, QTextEdit, QFileDialog, QListWidgetItem, QCheckBox, QDial)
+                             QWidget, QLabel, QSlider, QHBoxLayout, QGridLayout, QComboBox, QPushButton, QLineEdit, QListWidget, QTabWidget, QTextEdit, QFileDialog, QListWidgetItem, QCheckBox, QDial, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QSplitter)
 from PyQt6.QtCore import Qt, QTimer
 from collections import deque
 import soundfile as sf
@@ -12,11 +12,13 @@ import json
 import hashlib
 import webbrowser
 import subprocess
+import winsound
 
 from audio_engine import AudioEngine
 from journal_watcher import JournalWatcher
 from api_client import submit_signal
 import database as db
+from dsp import SignalProcessor, calculate_characteristics
 
 class ProfileReviewWindow(QWidget):
     def __init__(self, profile_name, profile_data):
@@ -36,6 +38,143 @@ class ProfileReviewWindow(QWidget):
         else:
             display_data = profile_data
         spec_view.setImage(np.ascontiguousarray(display_data.T), autoLevels=True)
+
+class SnapshotLabWindow(QWidget):
+    def __init__(self, snapshot_path, parent=None):
+        super().__init__()
+        self.snapshot_path = snapshot_path
+        self.parent_station = parent
+        self.setWindowTitle(f"Signal Lab: {os.path.basename(snapshot_path)}")
+        self.resize(1000, 600)
+        self.setStyleSheet("background-color: #050505; color: #FFA500;")
+        
+        self.layout = QVBoxLayout(self)
+        
+        # Header
+        self.header_label = QLabel(">> SIGNAL ANALYSIS LAB <<")
+        self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.header_label.setStyleSheet("font-family: Consolas; font-size: 14pt; font-weight: bold; color: #00FF00;")
+        self.layout.addWidget(self.header_label)
+        
+        # Spectrogram View
+        self.spec_view = pg.ImageView()
+        self.spec_view.ui.histogram.hide()
+        self.spec_view.ui.menuBtn.hide()
+        self.spec_view.getView().setAspectLocked(False)
+        self.spec_view.getView().invertY(False) # Time on X, Freq on Y usually for static
+        
+        # Custom Color Map
+        pos = np.array([0.0, 0.15, 0.4, 0.7, 1.0])
+        color = np.array([[0, 0, 0, 255], [5, 15, 30, 255], [160, 50, 0, 255], [255, 140, 0, 255], [255, 255, 220, 255]], dtype=np.ubyte)
+        self.spec_view.setColorMap(pg.ColorMap(pos, color))
+        
+        self.layout.addWidget(self.spec_view)
+        
+        # ROI Tool
+        self.roi = pg.RectROI(pos=[0, 0], size=[100, 100], pen=pg.mkPen('r', width=2), movable=True, resizable=True, rotatable=False)
+        self.spec_view.addItem(self.roi)
+        
+        # Controls
+        controls_layout = QHBoxLayout()
+        self.profile_name_input = QLineEdit()
+        self.profile_name_input.setPlaceholderText("Enter Profile Name...")
+        self.btn_save_selection = QPushButton("Save Selection as Profile")
+        self.btn_save_selection.clicked.connect(self.save_selection_as_profile)
+        
+        controls_layout.addWidget(QLabel("Profile Name:"))
+        controls_layout.addWidget(self.profile_name_input)
+        controls_layout.addWidget(self.btn_save_selection)
+        self.layout.addLayout(controls_layout)
+        
+        self.load_data()
+
+    def load_data(self):
+        # Check if it's a directory (snapshot) or a file (recording)
+        if os.path.isdir(self.snapshot_path):
+            wav_path = os.path.join(self.snapshot_path, "capture.wav")
+        else:
+            wav_path = self.snapshot_path
+
+        if not os.path.exists(wav_path):
+            self.header_label.setText("ERROR: Audio file not found.")
+            return
+            
+        try:
+            data, samplerate = sf.read(wav_path)
+            if data.ndim > 1:
+                data = np.mean(data, axis=1)
+                
+            # Generate Spectrogram
+            # Using matplotlib.mlab.specgram logic simplified or scipy
+            # For simplicity/speed without extra deps, we'll do a basic STFT here
+            n_fft = 4096
+            hop_length = 1024
+            window = np.hanning(n_fft)
+            
+            # Pad to ensure we don't lose data
+            pad_width = n_fft // 2
+            padded_data = np.pad(data, (pad_width, pad_width), mode='reflect')
+            
+            n_frames = (len(padded_data) - n_fft) // hop_length + 1
+            spectrogram = np.zeros((n_frames, n_fft // 2 + 1))
+            
+            for i in range(n_frames):
+                start = i * hop_length
+                end = start + n_fft
+                chunk = padded_data[start:end] * window
+                fft_res = np.fft.rfft(chunk)
+                spectrogram[i, :] = np.abs(fft_res)
+                
+            # Log scale
+            spectrogram = 20 * np.log10(spectrogram + 1e-9)
+            spectrogram = np.clip(spectrogram, 0, None)
+            
+            # Display
+            # ImageItem expects (x, y). We want Time on X, Freq on Y.
+            # Our spectrogram is (Time, Freq). So we pass it directly.
+            self.spec_view.setImage(spectrogram, autoLevels=True)
+            self.full_spectrogram_data = spectrogram # Store for extraction
+            
+            # Set ROI bounds
+            self.roi.maxBounds = pg.QtCore.QRectF(0, 0, spectrogram.shape[0], spectrogram.shape[1])
+            self.roi.setSize([spectrogram.shape[0] / 4, spectrogram.shape[1] / 2])
+            self.roi.setPos([spectrogram.shape[0] / 4, spectrogram.shape[1] / 4])
+            
+        except Exception as e:
+            self.header_label.setText(f"ERROR: {e}")
+
+    def save_selection_as_profile(self):
+        name = self.profile_name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Error", "Please enter a profile name.")
+            return
+            
+        # Get ROI data
+        # getArrayRegion returns the data within the ROI
+        # The image data is (Time, Freq)
+        selected_data = self.roi.getArrayRegion(self.full_spectrogram_data, self.spec_view.getImageItem())
+        
+        if selected_data is None or selected_data.size == 0:
+             QMessageBox.warning(self, "Error", "Invalid selection.")
+             return
+
+        # Save to DB
+        # We save it as a 2D profile. 
+        # Note: The live system expects (Time, Freq) or (Freq, Time) depending on orientation.
+        # The live system's `full_spectrogram_data` is (History/Time, Freq).
+        # Our `selected_data` is also (Time, Freq).
+        # However, the live matching logic might need to be robust to size differences.
+        # For now, we save it as is.
+        
+        try:
+            db.save_profile_to_db(name, "2D", selected_data)
+            QMessageBox.information(self, "Success", f"Profile '{name}' saved to database.")
+            if self.parent_station:
+                self.parent_station.load_profiles() # Refresh main window list
+            self.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save profile: {e}")
+
 
 class ComparisonWindow(QWidget):
     def __init__(self, snapshot_paths):
@@ -78,7 +217,7 @@ class ScienceStation(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Elite Signal Hunter: MK XXIV (Free Scroll)")
+        self.setWindowTitle("Elite Signal Hunter: MK XXVI (Automated)")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #050505; color: #FFA500;")
 
@@ -98,7 +237,6 @@ class ScienceStation(QMainWindow):
         self.latest_fft_complex = np.zeros(self.MAX_BINS, dtype=np.complex64)
         self.spectrogram_is_vertical = True
         self.auto_profiling_enabled = False
-        self.noise_profile = np.full(self.MAX_BINS, 1e-9)
         self.profiling_buffer = deque(maxlen=100)
         self.detection_threshold = 10.0
         self.signal_detected_cooldown = 0
@@ -111,6 +249,7 @@ class ScienceStation(QMainWindow):
         self.audio_devices = []
         self.engine = None
         self.comparison_windows = []
+        self.lab_windows = [] # Store references to lab windows
         self.batch_folder_path = None
         self.is_recording = False
         self.recording_start_time = None
@@ -125,6 +264,20 @@ class ScienceStation(QMainWindow):
         self.iq_rotation = 0.0
         self.iq_grid_visible = False
         self.iq_grid_items = []
+        
+        # Oscilloscope variables
+        self.scope_trigger_level = 0.0
+        self.scope_trigger_enabled = False
+        self.scope_timebase = 1.0 # 1.0 = full buffer, 0.1 = 10% of buffer
+        self.scope_gain = 1.0
+        self.scope_freeze = False
+        
+        # Spectrum variables
+        self.spectrum_hold_max = np.zeros(self.MAX_BINS)
+        self.spectrum_hold_decay = 0.95
+        
+        # Signal Processor
+        self.signal_processor = SignalProcessor(self.FFT_SIZE)
 
         # Setup UI layouts
         self.main_layout = QHBoxLayout()
@@ -168,6 +321,12 @@ class ScienceStation(QMainWindow):
         self.scope_layout = QVBoxLayout(self.scope_tab)
         self.scope_plot = pg.PlotWidget()
         self.scope_curve = self.scope_plot.plot(pen=pg.mkPen('#FFA500', width=2))
+        
+        self.spectrum_tab = QWidget()
+        self.spectrum_layout = QVBoxLayout(self.spectrum_tab)
+        self.spectrum_plot = pg.PlotWidget()
+        self.spectrum_curve = self.spectrum_plot.plot(pen=pg.mkPen('#00FF00', width=1))
+        self.spectrum_max_curve = self.spectrum_plot.plot(pen=pg.mkPen('#008800', width=1, style=Qt.PenStyle.DotLine))
 
         self.iq_tab = QWidget()
         self.iq_layout = QVBoxLayout(self.iq_tab)
@@ -178,6 +337,17 @@ class ScienceStation(QMainWindow):
         self.browser_layout = QVBoxLayout(self.browser_tab)
         self.snapshot_list_widget = QListWidget()
         self.btn_compare_snapshots = QPushButton("Compare Selected Snapshots")
+        self.btn_play_snapshot = QPushButton("Play Selected Snapshot")
+        self.btn_open_lab = QPushButton("Analyze in Lab (Define Profile)") # Renamed
+        self.btn_analyze_file = QPushButton("Analyze External File") # NEW BUTTON
+        self.lbl_browser_metadata = QLabel("Select a snapshot to view details.")
+        self.lbl_browser_metadata.setWordWrap(True)
+        self.lbl_browser_metadata.setStyleSheet("color: #AAAAAA; font-family: Consolas;")
+        
+        self.db_tab = QWidget()
+        self.db_layout = QVBoxLayout(self.db_tab)
+        self.db_table = QTableWidget()
+        self.btn_refresh_db = QPushButton("Refresh Database View")
         
         self.batch_tab = QWidget()
         self.batch_layout = QGridLayout(self.batch_tab)
@@ -225,7 +395,6 @@ class ScienceStation(QMainWindow):
         self.lbl_centroid = QLabel("CENTROID: --- Hz")
         self.profile_list_widget = QListWidget()
         self.profile_name_input = QLineEdit()
-        self.btn_define_roi = QPushButton("Define from Selection")
         self.btn_save_profile = QPushButton("Save Full Signal as Profile")
         self.btn_delete_profile = QPushButton("Delete Selected Profile")
         self.btn_review_profile = QPushButton("Review Selected Profile")
@@ -236,8 +405,10 @@ class ScienceStation(QMainWindow):
         db.init_db()
         self.setup_spec_tab()
         self.setup_scope_tab()
+        self.setup_spectrum_tab()
         self.setup_iq_tab()
         self.setup_browser_tab()
+        self.setup_database_tab()
         self.setup_batch_tab()
         self.setup_settings_tab()
         self.setup_control_panel()
@@ -265,11 +436,14 @@ class ScienceStation(QMainWindow):
         self.btn_triggered_capture.clicked.connect(self.toggle_triggered_capture)
         self.btn_submit_signal.clicked.connect(self.submit_current_signal)
         self.slider_capture_duration.valueChanged.connect(self.update_capture_buffer)
-        self.btn_define_roi.clicked.connect(self.toggle_roi_definition)
         self.btn_save_profile.clicked.connect(self.save_current_profile)
         self.btn_delete_profile.clicked.connect(self.delete_selected_profile)
         self.btn_review_profile.clicked.connect(self.review_selected_profile)
         self.btn_compare_snapshots.clicked.connect(self.launch_comparison_window)
+        self.btn_play_snapshot.clicked.connect(self.play_selected_snapshot)
+        self.btn_open_lab.clicked.connect(self.launch_lab_window)
+        self.btn_analyze_file.clicked.connect(self.analyze_external_file) # Connect new button
+        self.btn_refresh_db.clicked.connect(self.refresh_database_view)
         self.btn_select_batch_folder.clicked.connect(self.select_batch_folder)
         self.btn_run_batch.clicked.connect(self.run_batch_analysis)
         self.btn_record_audio.clicked.connect(self.toggle_recording)
@@ -277,6 +451,7 @@ class ScienceStation(QMainWindow):
         self.combo_rec_format.currentTextChanged.connect(self.update_recording_settings)
         self.combo_rec_subtype.currentTextChanged.connect(self.update_recording_settings)
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.snapshot_list_widget.itemSelectionChanged.connect(self.on_snapshot_selected)
 
         # Final initialization steps
         self.update_capture_buffer()
@@ -291,6 +466,8 @@ class ScienceStation(QMainWindow):
         self.check_first_launch()
         self.return_to_live()
 
+    # ... [Previous methods remain unchanged: setup_spec_tab, mouse_moved_on_spectrogram, return_to_live, render_view, update_iq_plot, check_first_launch, show_readme, setup_scope_tab, setup_spectrum_tab, setup_iq_tab] ...
+    
     def setup_spec_tab(self):
         # Rebuild Spectrogram Tab
         while self.spec_layout.count():
@@ -326,9 +503,10 @@ class ScienceStation(QMainWindow):
         self.anomaly_highlight_line.hide()
         self.spec_plot.addItem(self.anomaly_highlight_line)
         
-        self.roi.setZValue(1000)
-        self.roi.hide()
-        self.spec_plot.addItem(self.roi)
+        # Removed ROI from live spectrogram
+        # self.roi.setZValue(1000)
+        # self.roi.hide()
+        # self.spec_plot.addItem(self.roi)
 
         self.spec_widget.scene().sigMouseMoved.connect(self.mouse_moved_on_spectrogram)
         self.tabs.addTab(self.spec_tab, "Spectrogram")
@@ -375,7 +553,10 @@ class ScienceStation(QMainWindow):
         self.label.setText(">> VIEW SNAPPED TO LIVE FEED <<")
 
     def render_view(self):
-        gated_magnitude = np.clip(self.latest_magnitude - self.noise_profile, 0, None)
+        # 1. Process Spectrogram Data
+        # Use SignalProcessor for gating
+        gated_magnitude = self.signal_processor.apply_spectral_gate(self.latest_magnitude)
+        
         if self.use_log_scale: processed_data = 20 * np.log10(gated_magnitude + 1e-9) + 100
         else: processed_data = gated_magnitude * 5000
         processed_data = np.clip(processed_data, 0, None)
@@ -400,52 +581,67 @@ class ScienceStation(QMainWindow):
 
         if self.spectrogram_is_vertical:
             viewbox.invertY(True)
-            # Fix: Transpose data for vertical orientation so time is on Y-axis
             self.spec_image.setImage(np.ascontiguousarray(view_data.T), autoLevels=auto_levels)
             if not auto_levels:
                 min_level = self.slider_floor.value()
                 gain_factor = self.slider_gain.value() / 10.0
                 max_level = min_level + (100 / gain_factor)
                 self.spec_image.setLevels([min_level, max_level])
-            
-            # Fix: Set ranges correctly for vertical mode
-            # X-axis is Frequency (0 to cutoff_index)
-            # Y-axis is Time (0 to history_length)
             self.spec_image.setRect(pg.QtCore.QRectF(0, 0, cutoff_index, self.history_length))
             self.spec_plot.setXRange(0, cutoff_index)
             self.spec_plot.setYRange(0, self.history_length)
-            
             if self.anomaly_highlight_line: self.anomaly_highlight_line.setAngle(90)
         else: # Horizontal
             viewbox.invertY(False)
-            # Fix: No transpose needed for horizontal, but ensure contiguous array
             self.spec_image.setImage(np.ascontiguousarray(view_data), autoLevels=auto_levels)
             if not auto_levels:
                 min_level = self.slider_floor.value()
                 gain_factor = self.slider_gain.value() / 10.0
                 max_level = min_level + (100 / gain_factor)
                 self.spec_image.setLevels([min_level, max_level])
-            
-            # Fix: Set ranges correctly for horizontal mode
-            # X-axis is Time (0 to history_length)
-            # Y-axis is Frequency (0 to cutoff_index)
             self.spec_image.setRect(pg.QtCore.QRectF(0, 0, self.history_length, cutoff_index))
             self.spec_plot.setXRange(0, self.history_length)
             self.spec_plot.setYRange(0, cutoff_index)
-            
             if self.anomaly_highlight_line: self.anomaly_highlight_line.setAngle(0)
         
         if self.first_render:
             self.return_to_live()
 
-        self.scope_curve.setData(self.rolling_audio_buffer)
+        # 2. Update Oscilloscope
+        if not self.scope_freeze:
+            scope_data = self.rolling_audio_buffer * self.scope_gain
+            
+            # Triggering Logic
+            start_idx = 0
+            if self.scope_trigger_enabled:
+                # Find first crossing of trigger level with positive slope
+                # Simple implementation
+                crossings = np.where((scope_data[:-1] < self.scope_trigger_level) & (scope_data[1:] >= self.scope_trigger_level))[0]
+                if len(crossings) > 0:
+                    start_idx = crossings[0]
+            
+            # Apply Timebase (Zoom)
+            window_size = int(len(scope_data) * self.scope_timebase)
+            end_idx = min(start_idx + window_size, len(scope_data))
+            display_data = scope_data[start_idx:end_idx]
+            
+            self.scope_curve.setData(display_data)
+
+        # 3. Update Spectrum Analyzer
+        freqs = np.fft.rfftfreq(self.FFT_SIZE, 1/self.SAMPLE_RATE)
+        mag_db = 20 * np.log10(self.latest_magnitude + 1e-9)
         
+        # Update Max Hold
+        self.spectrum_hold_max = np.maximum(self.spectrum_hold_max * self.spectrum_hold_decay, mag_db)
+        
+        self.spectrum_curve.setData(freqs[:cutoff_index], mag_db[:cutoff_index])
+        self.spectrum_max_curve.setData(freqs[:cutoff_index], self.spectrum_hold_max[:cutoff_index])
+
         if self.is_recording:
             elapsed = (datetime.now() - self.recording_start_time).total_seconds()
             self.lbl_recording_status.setText(f"REC: {elapsed:.1f}s")
             
         if not self.is_hovering_spectrogram:
-            # Show live I/Q data for the peak frequency when not hovering
             peak_bin = np.argmax(self.latest_magnitude)
             iq_data = self.latest_fft_complex[peak_bin]
             self.update_iq_plot(iq_data)
@@ -487,11 +683,64 @@ class ScienceStation(QMainWindow):
             except Exception as e: print(f"Could not open README.md: {e}")
             
     def setup_scope_tab(self):
-        self.scope_plot.setYRange(-0.5, 0.5)
-        self.scope_plot.showGrid(x=True, y=True, alpha=0.3)
+        # Enhanced Oscilloscope Setup
+        self.scope_plot.setYRange(-1.0, 1.0)
+        self.scope_plot.showGrid(x=True, y=True, alpha=0.5)
+        self.scope_plot.setLabel('left', 'Amplitude')
+        self.scope_plot.setLabel('bottom', 'Samples')
+        
+        # Controls Layout
+        controls_layout = QHBoxLayout()
+        
+        # Trigger Controls
+        self.chk_scope_trigger = QCheckBox("Trigger")
+        self.chk_scope_trigger.stateChanged.connect(self.toggle_scope_trigger)
+        self.slider_scope_trigger = QSlider(Qt.Orientation.Horizontal)
+        self.slider_scope_trigger.setRange(-100, 100)
+        self.slider_scope_trigger.setValue(0)
+        self.slider_scope_trigger.valueChanged.connect(self.update_scope_trigger_level)
+        self.lbl_scope_trigger = QLabel("Trig: 0.00")
+        
+        # Timebase Control
+        self.slider_scope_timebase = QSlider(Qt.Orientation.Horizontal)
+        self.slider_scope_timebase.setRange(1, 100)
+        self.slider_scope_timebase.setValue(100)
+        self.slider_scope_timebase.valueChanged.connect(self.update_scope_timebase)
+        self.lbl_scope_timebase = QLabel("Zoom: 1.0x")
+        
+        # Gain Control
+        self.slider_scope_gain = QSlider(Qt.Orientation.Horizontal)
+        self.slider_scope_gain.setRange(1, 50)
+        self.slider_scope_gain.setValue(10)
+        self.slider_scope_gain.valueChanged.connect(self.update_scope_gain)
+        self.lbl_scope_gain = QLabel("Gain: 1.0x")
+        
+        # Freeze
+        self.btn_scope_freeze = QPushButton("Freeze")
+        self.btn_scope_freeze.setCheckable(True)
+        self.btn_scope_freeze.clicked.connect(self.toggle_scope_freeze)
+        
+        controls_layout.addWidget(self.chk_scope_trigger)
+        controls_layout.addWidget(self.lbl_scope_trigger)
+        controls_layout.addWidget(self.slider_scope_trigger)
+        controls_layout.addWidget(self.lbl_scope_timebase)
+        controls_layout.addWidget(self.slider_scope_timebase)
+        controls_layout.addWidget(self.lbl_scope_gain)
+        controls_layout.addWidget(self.slider_scope_gain)
+        controls_layout.addWidget(self.btn_scope_freeze)
+        
+        self.scope_layout.addLayout(controls_layout)
         self.scope_layout.addWidget(self.scope_plot)
         self.tabs.addTab(self.scope_tab, "Oscilloscope")
-        self.scope_tab.setLayout(self.scope_layout)
+
+    def setup_spectrum_tab(self):
+        self.spectrum_plot.setLabel('left', 'Magnitude (dB)')
+        self.spectrum_plot.setLabel('bottom', 'Frequency (Hz)')
+        self.spectrum_plot.showGrid(x=True, y=True, alpha=0.5)
+        self.spectrum_plot.setYRange(0, 150)
+        
+        self.spectrum_layout.addWidget(self.spectrum_plot)
+        self.tabs.addTab(self.spectrum_tab, "Spectrum Analyzer")
 
     def setup_iq_tab(self):
         self.iq_plot.setLabel('left', 'Quadrature')
@@ -505,11 +754,100 @@ class ScienceStation(QMainWindow):
         self.iq_tab.setLayout(self.iq_layout)
 
     def setup_browser_tab(self):
-        self.browser_layout.addWidget(QLabel("SAVED SNAPSHOTS:"))
-        self.browser_layout.addWidget(self.snapshot_list_widget)
-        self.browser_layout.addWidget(self.btn_compare_snapshots)
+        # Splitter for Archive (Left) and Data Card (Right)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Left Container (Inventory)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.addWidget(QLabel("SAVED SNAPSHOTS:"))
+        left_layout.addWidget(self.snapshot_list_widget)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addWidget(self.btn_play_snapshot)
+        btn_layout.addWidget(self.btn_compare_snapshots)
+        btn_layout.addWidget(self.btn_open_lab)
+        btn_layout.addWidget(self.btn_analyze_file) # Add new button
+        left_layout.addLayout(btn_layout)
+        
+        # Right Container (Data Card)
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.addWidget(QLabel("METADATA CARD:"))
+        right_layout.addWidget(self.lbl_browser_metadata)
+        right_layout.addStretch()
+        
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 200])
+        
+        self.browser_layout.addWidget(splitter)
+        
         self.snapshot_list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.tabs.addTab(self.browser_tab, "Snapshot Browser")
+
+    def on_snapshot_selected(self):
+        selected_items = self.snapshot_list_widget.selectedItems()
+        if not selected_items:
+            self.lbl_browser_metadata.setText("Select a snapshot to view details.")
+            return
+            
+        # Get metadata from DB or file
+        # We stored directory in UserRole
+        path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        meta_path = os.path.join(path, "metadata.json")
+        
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                    
+                context = meta.get("cmdr_context", {})
+                settings = meta.get("app_settings", {})
+                timestamp = meta.get("timestamp_utc", "Unknown")
+                
+                info = f"""
+                <b>TIMESTAMP:</b> {timestamp}<br>
+                <b>SYSTEM:</b> {context.get('StarSystem', 'Unknown')}<br>
+                <b>SHIP:</b> {context.get('Ship', 'Unknown')}<br>
+                <hr>
+                <b>SAMPLE RATE:</b> {settings.get('sample_rate', '---')} Hz<br>
+                <b>FFT SIZE:</b> {settings.get('fft_size', '---')}<br>
+                <b>SOURCE:</b> {settings.get('audio_source', '---')}
+                """
+                self.lbl_browser_metadata.setText(info)
+            except Exception as e:
+                self.lbl_browser_metadata.setText(f"Error reading metadata: {e}")
+        else:
+            self.lbl_browser_metadata.setText("Metadata file missing.")
+
+    def launch_lab_window(self):
+        selected_items = self.snapshot_list_widget.selectedItems()
+        if not selected_items:
+            self.label.setText(">> Select a snapshot to analyze. <<")
+            return
+        
+        path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        lab_win = SnapshotLabWindow(path, parent=self)
+        self.lab_windows.append(lab_win)
+        lab_win.show()
+        
+    def analyze_external_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Audio File", "", "Audio Files (*.wav)")
+        if file_path:
+            lab_win = SnapshotLabWindow(file_path, parent=self)
+            self.lab_windows.append(lab_win)
+            lab_win.show()
+
+    # ... [Rest of the class remains unchanged] ...
+    def setup_database_tab(self):
+        self.db_layout.addWidget(self.btn_refresh_db)
+        self.db_layout.addWidget(self.db_table)
+        self.db_table.setColumnCount(4)
+        self.db_table.setHorizontalHeaderLabels(["ID", "Timestamp", "Directory", "Metadata"])
+        self.db_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tabs.addTab(self.db_tab, "Database")
 
     def setup_batch_tab(self):
         self.batch_layout.addWidget(self.btn_select_batch_folder, 0, 0)
@@ -652,7 +990,7 @@ class ScienceStation(QMainWindow):
         profile_layout = QGridLayout(profile_container)
         self.lbl_identity.setStyleSheet("font-size: 12pt; font-weight: bold;")
         self.profile_name_input.setPlaceholderText("e.g., Thargoid Probe")
-        self.btn_define_roi.setCheckable(True)
+        # self.btn_define_roi.setCheckable(True) # Removed from live control
         profile_layout.addWidget(self.lbl_identity, 0, 0, 1, 2)
         profile_layout.addWidget(QLabel("SAVED PROFILES:"), 1, 0, 1, 2)
         profile_layout.addWidget(self.profile_list_widget, 2, 0, 1, 2)
@@ -660,7 +998,7 @@ class ScienceStation(QMainWindow):
         profile_layout.addWidget(self.btn_delete_profile, 3, 1, 1, 1)
         profile_layout.addWidget(QLabel("NEW PROFILE NAME:"), 4, 0, 1, 2)
         profile_layout.addWidget(self.profile_name_input, 5, 0, 1, 2)
-        profile_layout.addWidget(self.btn_define_roi, 6, 0, 1, 2)
+        # profile_layout.addWidget(self.btn_define_roi, 6, 0, 1, 2) # Removed from live control
         profile_layout.addWidget(self.btn_save_profile, 7, 0, 1, 2)
         
         # Signal Characteristics
@@ -790,8 +1128,12 @@ class ScienceStation(QMainWindow):
         
         with open(os.path.join(snapshot_dir, "capture.sha256"), 'w') as f_hash: f_hash.write(sha256_hash)
         
+        # Log to DB
+        db.log_snapshot_to_db(f"snap_{timestamp}", metadata["timestamp_utc"], snapshot_dir, metadata)
+        
         if not is_submission:
             self.label.setText(f">> Snapshot saved to {snapshot_dir} <<")
+            self.refresh_snapshot_browser()
             
         return metadata, sha256_hash
     
@@ -850,31 +1192,13 @@ class ScienceStation(QMainWindow):
             return
             
         # 2. Extract signal characteristics
-        gated_magnitude = np.clip(self.latest_magnitude - self.noise_profile, 0, None)
-        freqs = np.fft.rfftfreq(self.FFT_SIZE, 1/self.SAMPLE_RATE)
-        
-        signal_power = np.sum(gated_magnitude**2)
-        noise_power = np.sum(self.noise_profile**2)
-        snr = 10 * np.log10(float(signal_power) / float(noise_power)) if noise_power > 0 else float('inf')
-        
-        signal_bins = np.where(gated_magnitude > 0)[0]
-        bandwidth = freqs[signal_bins[-1]] - freqs[signal_bins[0]] if len(signal_bins) > 1 else 0
-        
-        centroid = np.sum(freqs * gated_magnitude) / np.sum(gated_magnitude) if np.sum(gated_magnitude) > 0 else 0
-        
-        peak_freq = freqs[np.argmax(gated_magnitude)]
-
-        signal_characteristics = {
-            "peak_frequency": peak_freq,
-            "snr": snr,
-            "bandwidth": bandwidth,
-            "spectral_centroid": centroid
-        }
+        gated_magnitude = self.signal_processor.apply_spectral_gate(self.latest_magnitude)
+        characteristics = calculate_characteristics(gated_magnitude, self.signal_processor.noise_mean, self.SAMPLE_RATE, self.FFT_SIZE)
 
         # 3. Call the API client
         success, sighting_id = submit_signal(
             cmdr_context=metadata["cmdr_context"],
-            signal_characteristics=signal_characteristics,
+            signal_characteristics=characteristics,
             raw_data_hash=raw_data_hash,
             notes="Manual submission from Elite Signal Hunter."
         )
@@ -898,35 +1222,9 @@ class ScienceStation(QMainWindow):
             self.label.setText(">> Please enter a profile name. <<")
             return
             
-        if self.btn_define_roi.isChecked():
-            pos = self.roi.pos()
-            size = self.roi.size()
-            
-            if self.spectrogram_is_vertical:
-                x_start, y_start = int(pos.x()), int(pos.y())
-                width, height = int(size.x()), int(size.y())
-            else:
-                y_start, x_start = int(pos.y()), int(pos.x())
-                height, width = int(size.y()), int(size.x())
-
-            x_start = max(0, x_start)
-            y_start = max(0, y_start)
-            
-            zoom_percent = self.slider_zoom.value() / 100.0
-            cutoff_index = max(50, int(self.MAX_BINS * zoom_percent))
-            
-            x_end = min(cutoff_index, x_start + width)
-            y_end = min(self.history_length, y_start + height)
-
-            if x_end > x_start and y_end > y_start:
-                profile_to_save = self.full_spectrogram_data[y_start:y_end, x_start:x_end]
-                save_type = "2D"
-            else:
-                self.label.setText(">> Invalid selection for profile. <<")
-                return
-        else:
-            profile_to_save = np.clip(self.latest_magnitude - self.noise_profile, 0, None)
-            save_type = "1D"
+        # Removed ROI logic from live save
+        profile_to_save = self.signal_processor.apply_spectral_gate(self.latest_magnitude)
+        save_type = "1D"
             
         try:
             db.save_profile_to_db(profile_name, save_type, profile_to_save)
@@ -989,6 +1287,23 @@ class ScienceStation(QMainWindow):
         self.comparison_windows.append(comp_win)
         comp_win.show()
 
+    def play_selected_snapshot(self):
+        selected_items = self.snapshot_list_widget.selectedItems()
+        if not selected_items:
+            self.label.setText(">> Select a snapshot to play. <<")
+            return
+        
+        path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        wav_path = os.path.join(path, "capture.wav")
+        if os.path.exists(wav_path):
+            try:
+                winsound.PlaySound(wav_path, winsound.SND_ASYNC)
+                self.label.setText(f">> Playing: {os.path.basename(path)} <<")
+            except Exception as e:
+                self.label.setText(f">> Error playing sound: {e} <<")
+        else:
+            self.label.setText(">> Audio file not found. <<")
+
     def refresh_snapshot_browser(self):
         self.snapshot_list_widget.clear()
         snapshots = db.get_all_snapshots()
@@ -996,6 +1311,15 @@ class ScienceStation(QMainWindow):
             item = QListWidgetItem(f"{snapshot['timestamp']} - {snapshot['id']}")
             item.setData(Qt.ItemDataRole.UserRole, snapshot['directory'])
             self.snapshot_list_widget.addItem(item)
+            
+    def refresh_database_view(self):
+        snapshots = db.get_all_snapshots()
+        self.db_table.setRowCount(len(snapshots))
+        for i, snap in enumerate(snapshots):
+            self.db_table.setItem(i, 0, QTableWidgetItem(snap['id']))
+            self.db_table.setItem(i, 1, QTableWidgetItem(snap['timestamp']))
+            self.db_table.setItem(i, 2, QTableWidgetItem(snap['directory']))
+            self.db_table.setItem(i, 3, QTableWidgetItem(str(snap['metadata'])))
 
     def select_batch_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
@@ -1040,14 +1364,17 @@ class ScienceStation(QMainWindow):
                     
                     latest_fft_complex = np.fft.rfft(chunk * np.hanning(self.FFT_SIZE))
                     latest_magnitude = np.abs(latest_fft_complex)
-                    gated_magnitude = np.clip(latest_magnitude - self.noise_profile, 0, None)
-                    signal_energy = np.sum(gated_magnitude)
-
-                    if signal_energy > self.detection_threshold:
+                    
+                    # Use SignalProcessor for anomaly detection
+                    if self.signal_processor.detect_anomaly(latest_magnitude, threshold=self.detection_threshold):
                         found_signal = True
                         time_in_file = start / samplerate
+                        
+                        # Calculate frequency of anomaly
+                        gated_magnitude = self.signal_processor.apply_spectral_gate(latest_magnitude)
                         anomaly_bin = np.argmax(gated_magnitude)
                         anomaly_freq = (anomaly_bin / self.MAX_BINS) * (self.SAMPLE_RATE / 2)
+                        
                         self.batch_results_text.append(f"  - Signal detected at {time_in_file:.2f}s, Freq: {anomaly_freq:,.0f} Hz")
                         QApplication.processEvents()
 
@@ -1088,45 +1415,51 @@ class ScienceStation(QMainWindow):
         if self.auto_profiling_enabled:
             self.profiling_buffer.append(self.latest_magnitude)
             if len(self.profiling_buffer) == self.profiling_buffer.maxlen:
-                self.noise_profile = np.min(self.profiling_buffer, axis=0)
+                # Update the SignalProcessor with the new noise profile
+                self.signal_processor.capture_noise_profile(list(self.profiling_buffer))
+                self.noise_profile = self.signal_processor.noise_mean # Keep for legacy compatibility if needed
 
     def update_signal_characteristics(self, gated_magnitude):
-        # Calculate SNR
-        signal_power = np.sum(gated_magnitude**2)
-        noise_power = np.sum(self.noise_profile**2)
-        snr = 10 * np.log10(float(signal_power) / float(noise_power)) if noise_power > 0 else float('inf')
+        characteristics = calculate_characteristics(gated_magnitude, self.signal_processor.noise_mean, self.SAMPLE_RATE, self.FFT_SIZE)
+        
+        snr = characteristics["snr"]
         self.lbl_snr.setText(f"SNR: {snr:.2f} dB")
 
-        # Calculate Bandwidth
-        freqs = np.fft.rfftfreq(self.FFT_SIZE, 1/self.SAMPLE_RATE)
-        signal_bins = np.where(gated_magnitude > 0)[0]
-        if len(signal_bins) > 1:
-            bandwidth = freqs[signal_bins[-1]] - freqs[signal_bins[0]]
+        bandwidth = characteristics["bandwidth"]
+        if bandwidth > 0:
             self.lbl_bandwidth.setText(f"BANDWIDTH: {bandwidth:,.0f} Hz")
         else:
             self.lbl_bandwidth.setText("BANDWIDTH: --- Hz")
 
-        # Calculate Spectral Centroid
-        if np.sum(gated_magnitude) > 0:
-            centroid = np.sum(freqs * gated_magnitude) / np.sum(gated_magnitude)
+        centroid = characteristics["spectral_centroid"]
+        if centroid > 0:
             self.lbl_centroid.setText(f"CENTROID: {centroid:,.0f} Hz")
         else:
             self.lbl_centroid.setText("CENTROID: --- Hz")
 
     def run_identification(self):
         if self.anomaly_highlight_line is None: return
-        gated_magnitude = np.clip(self.latest_magnitude - self.noise_profile, 0, None)
-        signal_energy = np.sum(gated_magnitude)
+        
+        # Use SignalProcessor for anomaly detection
+        is_anomaly = self.signal_processor.detect_anomaly(self.latest_magnitude, threshold=self.detection_threshold)
+        
+        gated_magnitude = self.signal_processor.apply_spectral_gate(self.latest_magnitude)
         best_match = "---"
         highest_score = 0
         
-        if signal_energy > self.detection_threshold:
+        if is_anomaly:
             self.update_signal_characteristics(gated_magnitude)
             if self.signal_detected_cooldown <= 0:
                 anomaly_bin = np.argmax(gated_magnitude)
                 anomaly_freq = (anomaly_bin / self.MAX_BINS) * (self.SAMPLE_RATE / 2)
                 self.label.setText(f">>!! SIGNAL DETECTED at {anomaly_freq:,.0f} Hz !!<<")
                 self.label.setStyleSheet("font-family: Consolas; font-size: 14pt; font-weight: bold; color: #FF0000;")
+                
+                # Play alert sound
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                except:
+                    pass
                 
                 pos_val = anomaly_bin
                 if self.spectrogram_is_vertical:
@@ -1196,6 +1529,7 @@ class ScienceStation(QMainWindow):
         self.btn_auto_profile.setText(f"Auto-Profiling: {status}")
         if not self.auto_profiling_enabled:
             self.noise_profile = np.full(self.MAX_BINS, 1e-9)
+            # Reset signal processor calibration if needed, or just stop updating it
         self.label.setText(f">> AUTO-PROFILING {status} <<")
         
     def toggle_scale(self):
@@ -1260,6 +1594,26 @@ class ScienceStation(QMainWindow):
             self.render_timer.start(16) # ~60 FPS
         if not self.identification_timer.isActive():
             self.identification_timer.start(100)
+
+    # Oscilloscope Helper Methods
+    def toggle_scope_trigger(self):
+        self.scope_trigger_enabled = self.chk_scope_trigger.isChecked()
+        
+    def update_scope_trigger_level(self):
+        self.scope_trigger_level = self.slider_scope_trigger.value() / 100.0
+        self.lbl_scope_trigger.setText(f"Trig: {self.scope_trigger_level:.2f}")
+        
+    def update_scope_timebase(self):
+        self.scope_timebase = self.slider_scope_timebase.value() / 100.0
+        self.lbl_scope_timebase.setText(f"Zoom: {self.scope_timebase:.2f}x")
+        
+    def update_scope_gain(self):
+        self.scope_gain = self.slider_scope_gain.value() / 10.0
+        self.lbl_scope_gain.setText(f"Gain: {self.scope_gain:.1f}x")
+        
+    def toggle_scope_freeze(self):
+        self.scope_freeze = self.btn_scope_freeze.isChecked()
+        self.btn_scope_freeze.setText("Resume" if self.scope_freeze else "Freeze")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
